@@ -58,24 +58,29 @@ def _probs(rec):
     except ValueError as e: raise HTTPException(422, str(e))
     Ls = enc["seg"].count(0); key = (tuple(enc["ids"][:Ls]), bool(enc.get("option_isolation")))
     cache = STATE["prefix_cache"]
+    want = model.evidence_head is not None and bool(enc["sent_idx"])
+    unpack = (lambda out: out) if want else (lambda out: (out, None))
     with STATE["lock"]:
         _sync(dev); t = time.time()
         eligible = PREFIX_CACHE_SIZE and Ls >= PREFIX_MIN_TOKENS
         if eligible and key in cache:
             prefix = cache.pop(key)                       # pop + reinsert = LRU order
-            ps = model.probs_with_prefix(enc, prefix); cache[key] = prefix
+            ps, ev = unpack(model.probs_with_prefix(enc, prefix, evidence=want)); cache[key] = prefix
             STATE["prefix_hits"] += 1; hit = True
         elif eligible:
-            ps, prefix = model.probs_and_prefix(enc)      # one pass, and the state prefix is kept for next time
+            out, prefix = model.probs_and_prefix(enc, evidence=want)   # one pass, and the state prefix is kept for next time
+            ps, ev = unpack(out)
             cache[key] = prefix
             while len(cache) > PREFIX_CACHE_SIZE: cache.pop(next(iter(cache)))
             STATE["prefix_misses"] += 1; hit = False
         else:
-            ps = model.probs(enc); hit = False
+            ps, ev = unpack(model.probs(enc, evidence=want)); hit = False
         _sync(dev); dt = time.time() - t
     if TEMPERATURE != 1.0:                      # opt-in calibration: same as scaling the pointer logits by 1/T (argmax unchanged)
         ps = [(lambda q: q / q.sum())(p.clamp_min(1e-9) ** (1.0 / TEMPERATURE)) for p in ps]
-    return [p.tolist() for p in ps], {"tokens": len(enc["ids"]), "state_tokens": Ls, "latency_ms": round(dt * 1000, 1), "prefix_cache_hit": hit}
+    meta = {"tokens": len(enc["ids"]), "state_tokens": Ls, "latency_ms": round(dt * 1000, 1), "prefix_cache_hit": hit}
+    if ev is not None: meta["evidence"] = [None if p is None else p.tolist() for p in ev]
+    return [p.tolist() for p in ps], meta
 
 
 @app.post("/v1/systemone")
@@ -84,7 +89,7 @@ def systemone(req: SystemOneRequest):
     if DATE_FACTS: req = req.model_copy(update={"state": with_date_facts(req.state)})
     rec, meta = to_record(req)
     ps, m = _probs(rec)
-    answers = to_answers(ps, meta)
+    answers = to_answers(ps, meta, m.get("evidence"), req.sentences)
     return {"model": req.model, "answers": answers, "usage": {"input_tokens": m["tokens"], "output_tokens": output_tokens(STATE["tok"], answers)}, "latency_ms": m["latency_ms"]}
 
 
@@ -119,7 +124,7 @@ def systemone_separate(req: SystemOneRequest):
     answers, tokens, ms = {}, 0, 0.0
     for qid, q in req.questions.items():
         rec, meta = to_record(req.model_copy(update={"questions": {qid: q}, **({"state": with_date_facts(req.state)} if DATE_FACTS else {})})); ps, m = _probs(rec)
-        answers.update(to_answers(ps, meta)); tokens += m["tokens"]; ms += m["latency_ms"]
+        answers.update(to_answers(ps, meta, m.get("evidence"), req.sentences)); tokens += m["tokens"]; ms += m["latency_ms"]
     return {"model": req.model, "answers": answers, "usage": {"input_tokens": tokens, "output_tokens": output_tokens(STATE["tok"], answers)}, "latency_ms": round(ms, 1)}
 
 

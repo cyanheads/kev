@@ -53,7 +53,8 @@ def load(run, dev, dtype=None, merge=True, attn=None):
     attn = attn or os.environ.get("KEV_ATTN") or None
     tok = load_tokenizer(meta["base"], revision=meta.get("base_revision"))
     m = DecisionModel(meta["base"], tok, dev, lora=None, revision=meta.get("base_revision"), head_dim=meta.get("head_dim", 256),
-                      option_isolation=meta.get("option_isolation", False), dtype=torch.float32 if merge else dtype, attn=attn)
+                      option_isolation=meta.get("option_isolation", False), dtype=torch.float32 if merge else dtype, attn=attn,
+                      dustbin=bool(meta.get("dustbin", False)), evidence="evidence" in meta)
     from peft import PeftModel
     m.lm = PeftModel.from_pretrained(m.lm, run).to(dev)   # trainable token embeddings, if any, are inside the adapter
     scale = float(os.environ.get("KEV_LORA_SCALE", "1"))
@@ -64,7 +65,9 @@ def load(run, dev, dtype=None, merge=True, attn=None):
         m.lora_scale = scale
     if merge: m.lm = m.lm.merge_and_unload()               # in fp32: exact
     if dtype != torch.float32: m.lm = m.lm.to(dtype)
-    m.head.load_state_dict(meta["head"]); m.eval()
+    m.head.load_state_dict(meta["head"])
+    if "evidence" in meta: m.evidence_head.load_state_dict(meta["evidence"])
+    m.eval()
     return tok, m
 
 

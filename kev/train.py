@@ -22,17 +22,28 @@ def permuted_copy(rec, rng):
 
 def question_loss(z, q, dev, ord_w):
     """Cross-entropy (or cross-entropy against a soft target when the question carries one), optionally plus the
-    normalized ranked probability score for ordered levels."""
+    normalized ranked probability score for ordered levels.
+
+    With a dustbin head z has one extra logit: an `unknown: true` question's label is that index, a soft target puts no
+    mass on it, and the ordered-levels term is computed on the real levels renormalised."""
+    K = len(q.get("keys") or ()) or z.shape[-1]
     if q.get("target") is not None:
         t = torch.tensor(q["target"], device=dev, dtype=z.dtype)
+        if t.numel() < z.shape[-1]: t = F.pad(t, (0, z.shape[-1] - t.numel()))
         return -(t * F.log_softmax(z, -1)).sum()
     y = torch.tensor([q["label"]], device=dev)
     loss = F.cross_entropy(z[None], y)
     if q["qtype"] == "score" and ord_w > 0:
         p = F.softmax(z, -1)
+        if K < len(p): p = p[:K] / p[:K].sum()
         observed_cdf = (torch.arange(len(p) - 1, device=dev) >= q["label"]).to(p.dtype)
         loss = loss + ord_w * (p.cumsum(-1)[:-1] - observed_cdf).square().mean()
     return loss
+
+
+def evidence_loss(z, positives):
+    """-log of the probability mass the sentence pointer puts on this question's gold sentences."""
+    return -torch.logsumexp(F.log_softmax(z, -1)[torch.tensor(positives, device=z.device)], 0)
 
 
 def anchor_loss(z, q, target, dev):
@@ -93,7 +104,10 @@ def main():
     ap.add_argument("--anchor_w", type=float, default=0.0, help="weight of KL(base || model) toward the frozen base model's zero-shot distribution, per anchored question")
     ap.add_argument("--anchor_sources", default="", help="comma-separated sources to anchor (default: every record with a target)")
     ap.add_argument("--out", default="runs/kev")
+    ap.add_argument("--dustbin", type=int, choices=[0, 1], default=0, help="pointer head gets a learned UNKNOWN key: the readout is a distribution over K+1 outcomes and a question marked `unknown: true` is labelled with it")
+    ap.add_argument("--evidence_w", type=float, default=0.0, help="weight of the sentence-pointer loss (a second pointer head from <decide> to the state tokens that end each sentence); 0 = no evidence head")
     ap.add_argument("--data", default="", help="your own labelled requests, one JSON object per line (see kev.data.load_records); an alternative to --suite for fine-tuning, or combined with --suite and --replay")
+    ap.add_argument("--data_limit", type=int, default=0, help="deterministic subsample of N --data records, by --seed (smoke runs); 0 = all. Sampled rather than sliced so a concatenated file keeps its mix of sources")
     ap.add_argument("--replay", type=int, default=0, help="with --data and --suite: mix in this many records sampled (by --seed) from the suite's training partition, so a delta fine-tune does not forget the released recipe")
     ap.add_argument("--init_from", default="", help="delta mode: warm-start LoRA and the pointer head from an existing run "
                                                    "(local directory or hub id) instead of starting from the base model; keeps the "
@@ -105,7 +119,7 @@ def main():
         ap.error("epochs, accum, n_per_source, lora, batch and synthetic_repeat must be positive; 0 < public_frac <= 1")
     if a.dtype == "bf16" and a.device != "cuda":
         ap.error("--dtype bf16 requires --device cuda")
-    if a.lr <= 0 or a.head_lr < 0 or a.weight_decay < 0 or min(a.ord_w, a.perm_kl, a.anchor_w) < 0 or not 0 <= a.perm_frac <= 1:
+    if a.lr <= 0 or a.head_lr < 0 or a.weight_decay < 0 or min(a.ord_w, a.perm_kl, a.anchor_w, a.evidence_w, a.data_limit) < 0 or not 0 <= a.perm_frac <= 1:
         ap.error("invalid learning rate or loss weights")
     if bool(a.anchor) != (a.anchor_w > 0):
         ap.error("--anchor and --anchor_w > 0 go together")
@@ -131,7 +145,8 @@ def main():
     tok = load_tokenizer(a.base, revision=revision)
     model = DecisionModel(a.base, tok, dev, lora=a.lora, revision=revision, head_dim=a.head_dim, lora_targets=a.lora_targets,
                           option_isolation=bool(a.option_isolation), special_embeddings=bool(a.special_embeddings),
-                          dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32)
+                          dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32,
+                          dustbin=bool(a.dustbin), evidence=a.evidence_w > 0)
     if a.checkpointing:
         model.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.lm.config.use_cache = False
@@ -158,7 +173,13 @@ def main():
         if missing:
             raise ValueError(f"--init_from {src} does not cover {len(missing)} of this model's adapter tensors (e.g. {missing[:2]}); check --lora_targets")
         set_peft_model_state_dict(model.lm, weights)
-        model.head.load_state_dict(meta["head"])
+        # the two dustbin parameters are the only ones allowed to be absent: a released non-dustbin head warm-starts a
+        # dustbin run, and everything else must match exactly (a silently half-loaded head still trains and still reports a loss)
+        missing_head, unexpected_head = model.head.load_state_dict(meta["head"], strict=False)
+        if unexpected_head or set(missing_head) - {"null_key", "null_bias"}:
+            raise ValueError(f"--init_from {src}: pointer head does not match (missing {sorted(missing_head)}, unexpected {sorted(unexpected_head)})")
+        if missing_head:
+            print(f"delta: warm start adds the UNKNOWN dustbin key ({sorted(missing_head)}) to the pointer head", flush=True)
         init_source = {"init_from": a.init_from, "resolved": str(src), "adapter_sha256": digest(Path(src) / "adapter_model.safetensors"), "head_sha256": digest(Path(src) / "head.pt")}
         print(f"delta: warm start from {src}: {len(weights)} adapter tensors and the pointer head loaded", flush=True)
     print(f"device={dev} trainable params={sum(p.numel() for p in model.trainable_parameters())/1e6:.1f}M", flush=True)
@@ -167,6 +188,10 @@ def main():
     if a.replay and not (a.data and a.suite): ap.error("--replay needs both --data and --suite")
     if a.data:
         reqs = load_records(a.data)
+        if a.data_limit and a.data_limit < len(reqs):
+            keep = sorted(random.Random(source_seed(a.seed, "data_limit")).sample(range(len(reqs)), a.data_limit))
+            reqs = [reqs[i] for i in keep]
+            print(f"data_limit: sampled {len(reqs)} records, sources {dict(Counter(r['_meta']['source'] for r in reqs))}", flush=True)
         if a.replay:
             pool = load_split(a.suite, "train"); replay = random.Random(f"replay:{a.seed}").sample(pool, min(a.replay, len(pool)))
             print(f"replay: {len(replay)} of {len(pool)} suite training records mixed with {len(reqs)} from {a.data}", flush=True); reqs = reqs + replay
@@ -195,7 +220,7 @@ def main():
         from .study_v3 import validate_training
         # --data records are the user's own (validated by load_records; never an eval-only source by construction of their
         # names); the suite's rules apply to the replay sample and to suite-only runs
-        validate_training([r for r in reqs if not a.data or not r["_meta"]["source"].startswith(("custom", "night2_"))], manifest)
+        validate_training([r for r in reqs if not a.data or not r["_meta"]["source"].startswith(("custom", "night2_", "stack_"))], manifest)
         if a.data and any(r["_meta"]["source"] in set(EVAL_ONLY) | set(manifest.get("eval_only_sources", [])) for r in reqs):
             raise ValueError("--data contains an eval-only source")
     SYNTHETIC = ("legacy_policy", "compositional", "contrastive")
@@ -215,7 +240,7 @@ def main():
     print(f"{len(reqs)} training requests (holdout={holdout}), questions by type "
           f"{dict(Counter(q['qtype'] for r in reqs for q in materialize(r)['questions']))}")
 
-    head_params = list(model.head.parameters()); head_ids = {id(p) for p in head_params}
+    head_params = model.head_parameters(); head_ids = {id(p) for p in head_params}
     groups = [{"params": [p for p in model.trainable_parameters() if id(p) not in head_ids], "lr": a.lr},
               {"params": head_params, "lr": a.head_lr or a.lr}]
     opt = torch.optim.AdamW(groups, lr=a.lr, weight_decay=a.weight_decay)
@@ -244,12 +269,19 @@ def main():
                 if a.perm_kl > 0 and item_rng.random() < a.perm_frac and any(q["qtype"] == "choice" and len(q["options"]) >= 3 for q in rec["questions"]):
                     rec2, perms = permuted_copy(rec, item_rng); perm_jobs.append((len(recs) - 1, model.encode(tok, rec2, strict=True), perms))
             with autocast:
-                logits_b = model.forward_batch(encs)
+                out = model.forward_batch(encs, evidence=a.evidence_w > 0)
+                logits_b, evidence_b = out if a.evidence_w > 0 else (out, None)
                 logits2_b = model.forward_batch([e for _, e, _ in perm_jobs]) if perm_jobs else []
             loss = 0.0
-            for logits, rec, rid, src in zip(logits_b, recs, rec_ids, rec_sources):
+            for bi, (logits, rec, rid, src) in enumerate(zip(logits_b, recs, rec_ids, rec_sources)):
                 ce = sum(question_loss(z.float(), q, dev, a.ord_w) for z, q in zip(logits, rec["questions"])) / len(logits)
                 run["ce"] += ce.item(); loss = loss + ce
+                if evidence_b and evidence_b[bi]:
+                    # gold sentences are resolved to sentence-key positions by encode(); a question whose positive was
+                    # truncated out of the state carries None and is skipped
+                    terms = [evidence_loss(z.float(), gold) for z, gold in zip(evidence_b[bi], encs[bi]["evidence"]) if z is not None and gold]
+                    if terms:
+                        ev = sum(terms) / len(terms); loss = loss + a.evidence_w * ev; run["ev"] += ev.item(); run["ev_n"] += 1
                 if anchors and rid in anchors and (anchor_sources is None or src in anchor_sources):
                     terms = [t for t in (anchor_loss(z.float(), q, anchors[rid].get(q["qid"]), dev) for z, q in zip(logits, rec["questions"])) if t is not None]
                     if terms:
@@ -273,12 +305,15 @@ def main():
                 opt.step(); sched.step(); opt.zero_grad(); step += 1
                 if dev == "mps": torch.mps.empty_cache()
                 if step % 10 == 0:
-                    print(f"ep{ep} step {step}/{steps} loss {run['ce']/run['n']:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
+                    print(f"ep{ep} step {step}/{steps} loss {run['ce']/run['n']:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} "
+                          f"evidence {run['ev']/max(run['ev_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
                     run = Counter()
     os.makedirs(a.out, exist_ok=True)
     model.lm.save_pretrained(a.out)
     torch.save({"head": model.head.state_dict(), "base": a.base, "base_revision": revision, "lora": a.lora, "head_dim": a.head_dim,
                 "option_isolation": bool(a.option_isolation), "special_embeddings": bool(a.special_embeddings), "weights_dtype": a.weights_dtype,
+                "dustbin": bool(a.dustbin), "evidence_w": a.evidence_w,
+                **({"evidence": model.evidence_head.state_dict()} if model.evidence_head is not None else {}),
                 "holdout": holdout, "args": vars(a), "suite_sha256": suite_hash, "init_source": init_source}, f"{a.out}/head.pt")
     tok.save_pretrained(a.out)
     write_json(out_dir / "training_metrics.json", {"wall_seconds": time.time() - t0, "records_seen": seen,

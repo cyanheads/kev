@@ -16,12 +16,14 @@ class Noul(BaseModel):
     type: Literal["noul"]
     instructions: JSONContent
     criteria: dict[str, JSONContent] | None = None
+    depends_on: list[str] | None = None
 
 
 class Choice(BaseModel):
     type: Literal["choice"]
     instructions: JSONContent
     criteria: dict[str, JSONContent]
+    depends_on: list[str] | None = None
 
     @model_validator(mode="after")
     def _check(self):
@@ -33,6 +35,7 @@ class Score(BaseModel):
     type: Literal["score"]
     instructions: JSONContent
     criteria: list[JSONContent] = Field(min_length=2, max_length=MAX_OPTIONS)
+    depends_on: list[str] | None = None
 
 
 Question = Union[Noul, Choice, Score]
@@ -42,6 +45,23 @@ class SystemOneRequest(BaseModel):
     state: JSONContent
     model: str = "kev-latest"
     questions: dict[str, Question] = Field(min_length=1)
+    sentences: list[str] | None = None      # spans of the rendered state the evidence pointer may point at (see kev.model.encode)
+
+
+def dependency_indices(order, names, qid):
+    """Map a question's dependency ids to positions in `order`. A dependency must be an EARLIER question of the same
+    record; that rules out self-reference, forward reference and therefore every cycle."""
+    position = {name: i for i, name in enumerate(order)}
+    if qid not in position: raise ValueError(f"unknown question {qid!r}")
+    here = position[qid]
+    out = []
+    for name in names:
+        if name not in position:
+            raise ValueError(f"question {qid!r} depends on {name!r}, which is not a question of this record")
+        if position[name] >= here:
+            raise ValueError(f"question {qid!r} depends on {name!r}, which is not an earlier question (forward reference or cycle)")
+        out.append(position[name])
+    return out
 
 
 def render(v: JSONContent, indent: int = 0) -> str:
@@ -93,6 +113,7 @@ def with_date_facts(state):
 def to_record(req: SystemOneRequest):
     """-> internal record for encode(), plus per-question metadata to map probabilities back."""
     qs, meta = [], []
+    order = list(req.questions)
     for qid, q in req.questions.items():
         instr = render(q.instructions)
         if q.type == "noul":
@@ -106,7 +127,11 @@ def to_record(req: SystemOneRequest):
             opts = [render(x) for x in q.criteria]
             meta.append({"id": qid, "type": "score", "legend": {str(i): render(x) for i, x in enumerate(q.criteria)}})
         qs.append({"instr": instr, "options": opts, "label": 0})
-    return {"state": render(req.state), "questions": qs}, meta
+        if q.depends_on:
+            qs[-1]["deps"] = dependency_indices(order, q.depends_on, qid)
+    rec = {"state": render(req.state), "questions": qs}
+    if req.sentences: rec["sentences"] = [{"text": s} for s in req.sentences]
+    return rec, meta
 
 
 def choice_confidence(p: list[float]) -> float:
@@ -125,17 +150,39 @@ def r2(x: float) -> float:
     return round(float(x), 2)
 
 
-def to_answers(probs: list[list[float]], meta: list[dict]) -> dict[str, Any]:
+def option_count(m: dict) -> int:
+    return 2 if m["type"] == "noul" else len(m["keys"]) if m["type"] == "choice" else len(m["legend"])
+
+
+def split_unknown(p: list[float], k: int) -> tuple[list[float], float | None]:
+    """A dustbin head returns k+1 probabilities: the k real options plus UNKNOWN. Returns the distribution renormalised
+    over the real options and the dustbin mass (None when the head has no dustbin)."""
+    if len(p) == k: return list(p), None
+    if len(p) != k + 1: raise ValueError(f"expected {k} or {k + 1} probabilities, got {len(p)}")
+    total = sum(p[:k])
+    return [x / total for x in p[:k]], p[k]
+
+
+def to_answers(probs: list[list[float]], meta: list[dict], evidence: list | None = None, sentences: list[str] | None = None) -> dict[str, Any]:
+    """evidence: per question, a distribution over `sentences` from the checkpoint's evidence pointer (None when the
+    checkpoint has no evidence head). The top 3 sentences are reported alongside the answer."""
     out = {}
-    for p, m in zip(probs, meta):
+    for i, (p, m) in enumerate(zip(probs, meta)):
+        p, unknown = split_unknown(p, option_count(m))
         if m["type"] == "noul":
-            out[m["id"]] = {"type": "noul", "noul": r2(p[1])}
+            answer = {"type": "noul", "noul": r2(p[1])}
         elif m["type"] == "choice":
             dist = {k: r2(v) for k, v in zip(m["keys"], p)}
-            out[m["id"]] = {"type": "choice", "choice": m["keys"][max(range(len(p)), key=lambda i: p[i])], "confidence": r2(choice_confidence(p)), "probabilities": dist}
+            answer = {"type": "choice", "choice": m["keys"][max(range(len(p)), key=lambda i: p[i])], "confidence": r2(choice_confidence(p)), "probabilities": dist}
         else:
             score = sum(i * pi for i, pi in enumerate(p))
-            out[m["id"]] = {"type": "score", "score": r2(score), "legend": m["legend"], "probabilities": {str(i): r2(v) for i, v in enumerate(p)}, "confidence": r2(score_confidence(p))}
+            answer = {"type": "score", "score": r2(score), "legend": m["legend"], "probabilities": {str(i): r2(v) for i, v in enumerate(p)}, "confidence": r2(score_confidence(p))}
+        if unknown is not None: answer["unknown"] = r2(unknown)
+        pointed = (evidence or [None] * len(meta))[i]
+        if pointed is not None and sentences:
+            top = sorted(range(len(pointed)), key=lambda j: -pointed[j])[:3]
+            answer["evidence"] = [{"sentence": sentences[j], "p": r2(pointed[j])} for j in top]
+        out[m["id"]] = answer
     return out
 
 

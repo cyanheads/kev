@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import random
 from datasets import load_dataset
-from .api import SystemOneRequest, to_record
+from .api import SystemOneRequest, dependency_indices, to_record
 
 
 REPOS = {"banking77": "legacy-datasets/banking77", "boolq": "google/boolq", "agnews": "fancyzhx/ag_news",
@@ -319,7 +319,7 @@ def augment(req, rng, p_none=0.1, p_none_distract=0.12, p_distract=0.15):
         if q["type"] != "choice":
             out["questions"][qid] = q; continue
         crit, y = dict(q["criteria"]), q["label"]
-        if q.get("target") is not None:                       # soft-target questions: permute only; inserting or swapping options would change the target's meaning
+        if q.get("target") is not None or q.get("unknown"):   # soft-target and dustbin-labelled questions: permute only; inserting or swapping options would change the target's meaning
             keys = list(crit); rng.shuffle(keys); out["questions"][qid] = {**q, "criteria": {k: crit[k] for k in keys}}; continue
         r = rng.random()
         none_options = [(k, v) for k, v in NONE_OPTIONS if k not in crit]
@@ -381,6 +381,7 @@ def materialize(req):
     """Labelled request -> internal record via the serving path (api.to_record), attaching int labels and src."""
     clean = {"state": req["state"], "questions": {qid: {k: v for k, v in q.items() if k not in ("label", "src")} for qid, q in req["questions"].items()}}
     rec, meta = to_record(SystemOneRequest.model_validate(clean))
+    order = list(req["questions"])
     for q, m, (qid, src_q) in zip(rec["questions"], meta, req["questions"].items()):
         y = src_q["label"]
         q["label"] = int(y) if m["type"] == "noul" else m["keys"].index(y) if m["type"] == "choice" else int(y)
@@ -392,4 +393,15 @@ def materialize(req):
             t = [float(src_q["target"].get(k, 0.0)) for k in q["keys"]]
             if sum(t) <= 0: raise ValueError(f"target for {qid} puts no mass on any option")
             q["target"] = [x / sum(t) for x in t]
+        if src_q.get("deps") is not None:
+            # question DAG: the ids of earlier questions whose branches this question's row may read (kev.model.rows_of)
+            q["deps"] = dependency_indices(order, src_q["deps"], qid)
+        if src_q.get("unknown"):
+            # the evidence for this question was removed: the answer is the dustbin key, index K (kev.model.PointerHead)
+            q["unknown"] = True; q["label"] = len(q["options"])
+        if src_q.get("evidence") is not None:
+            q["evidence"] = list(src_q["evidence"])
+        if src_q.get("dag_role"): q["dag_role"] = src_q["dag_role"]
+    sentences = (req.get("_meta") or {}).get("sentences")
+    if sentences: rec["sentences"] = sentences
     return rec

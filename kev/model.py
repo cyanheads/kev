@@ -27,6 +27,29 @@ def user_tokens(tok, text):
 OPT_NONE, OPT_DECIDE = -1, -2   # values of enc["opt"]: instruction/state tokens, and the <decide> token
 
 
+def sentence_token_indices(tok, text, sentences):
+    """Index, within the state's own token list, of the token holding each sentence's last character.
+
+    Offsets are computed on the text `user_tokens` actually feeds the tokenizer (`<|x|>` rewritten to `<¦x¦>`, same
+    character count), so the mapping matches the ids in the encoding. Sentences are located verbatim, in order.
+    """
+    rewritten = _SPECIAL_RE.sub(r"<¦\1¦>", text)
+    offsets = tok(rewritten, add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]
+    out, cursor = [], 0
+    for s in sentences:
+        needle = _SPECIAL_RE.sub(r"<¦\1¦>", s["text"])
+        at = rewritten.find(needle, cursor)
+        if at < 0:
+            raise ValueError(f"sentence not found in the rendered state: {s['text']!r}")
+        cursor = at + len(needle)
+        last = cursor - 1
+        token = next((j for j, (a, b) in enumerate(offsets) if a <= last < b), None)
+        if token is None:
+            raise ValueError(f"no token covers the end of sentence {s['text']!r}")
+        out.append(token)
+    return out
+
+
 def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, option_isolation=False):
     """Pack one record: [<state> ...] then per-question [<q> instr <opt> o </opt>... <decide>].
 
@@ -37,6 +60,14 @@ def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, o
     option_isolation=True: every option span is its own sub-branch (it sees state + instruction + itself only), all
     option spans share the same position ids, and <decide> sits at one fixed position after the longest span. Then the
     per-option representations and <decide>'s attention over them are permutation-invariant by construction.
+
+    Question DAGs: a question may carry `deps` (indices of earlier questions of the same record). The packing is
+    unchanged - deps only change the row form (rows_of), where a question's row also carries its dependency closure.
+
+    Evidence pointer: `rec["sentences"]` ([{"text", "facts"}] in rendered order) yields `sent_idx`, the state-token
+    index of each sentence's last token. Sentences pushed past `max_state` are dropped (counted in
+    `sentences_dropped`), and `evidence` maps each question's gold sentence ordinals (`q["evidence"]`) to positions in
+    `sent_idx`, or None when the question has no gold or one of its positives was dropped.
     """
     state_tokens = user_tokens(tok, rec["state"])
     if strict and len(state_tokens) + 1 > max_state:
@@ -44,7 +75,7 @@ def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, o
     S = [tok.convert_tokens_to_ids(SPECIAL[0])] + state_tokens[: max_state - 1]
     ids, seg, pos, opt = list(S), [0] * len(S), list(range(len(S))), [OPT_NONE] * len(S)
     q_id, o_id, c_id, d_id = (tok.convert_tokens_to_ids(t) for t in SPECIAL[1:])
-    decide_idx, opt_idx = [], []
+    decide_idx, opt_idx, deps = [], [], []
     for k, q in enumerate(rec["questions"], start=1):
         instr = [q_id] + user_tokens(tok, q["instr"])
         spans = [[o_id] + user_tokens(tok, o) + [c_id] for o in q["options"]]
@@ -63,7 +94,20 @@ def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, o
             cursor += len(sp); ends.append(cursor - 1)
         ids += br; seg += [k] * len(br); pos += br_pos; opt += br_opt
         decide_idx.append(base + len(br) - 1); opt_idx.append([base + e for e in ends])
+        q_deps = tuple(q.get("deps") or ())
+        if any(not 0 <= d < k - 1 for d in q_deps):
+            raise ValueError(f"question {k - 1} depends on {sorted(q_deps)}; dependencies must be earlier questions")
+        deps.append(q_deps)
+    if option_isolation and any(deps):
+        raise ValueError("option_isolation needs the packed mask; question dependencies need the row form")
+    sent_idx, kept, dropped = [], {}, 0
+    for i, j in enumerate(sentence_token_indices(tok, rec["state"], rec["sentences"]) if rec.get("sentences") else []):
+        if 1 + j < len(S): kept[i] = len(sent_idx); sent_idx.append(1 + j)
+        else: dropped += 1
+    evidence = [None if not (gold := q.get("evidence")) or any(s not in kept for s in gold) else [kept[s] for s in gold]
+                for q in rec["questions"]]
     return {"ids": ids, "seg": seg, "pos": pos, "opt": opt, "option_isolation": option_isolation, "decide_idx": decide_idx, "opt_idx": opt_idx,
+            "deps": deps, "sent_idx": sent_idx, "sentences_dropped": dropped, "evidence": evidence,
             "labels": [q["label"] for q in rec["questions"]], "state_truncated": len(state_tokens) + 1 > max_state}
 
 
@@ -101,36 +145,80 @@ def branch_mask_batch(segs, device, dtype=torch.float32, opts=None, length=None)
     return torch.zeros(len(segs), L, L, dtype=dtype, device=device).masked_fill(~allow, torch.finfo(dtype).min)[:, None]
 
 
+def _softmax_or_none(logits):
+    """Evidence pointer logits -> probabilities, or None when the checkpoint or the record has no sentences."""
+    if not logits or all(z is None for z in logits): return None
+    return [None if z is None else F.softmax(z, -1).cpu() for z in logits]
+
+
+def dependency_closure(deps, k):
+    """Every question question k transitively depends on, ascending. Dependencies point backwards only, so ascending
+    index order is a topological order."""
+    seen, stack = set(), list(deps[k])
+    while stack:
+        j = stack.pop()
+        if j in seen: continue
+        seen.add(j); stack.extend(deps[j])
+    return sorted(seen)
+
+
 def rows_of(enc):
     """Split a packed encoding into its state and per-question branch rows.
 
     Returns (state_ids, state_pos, rows) with rows[k] = {"ids", "pos", "decide", "opts"}: the branch tokens of question
     k with their (already state-continuing) positions, and the readout offsets *within the branch*. Feeding
     state + rows[k] as one causal row is equivalent to the packed block-causal form for that question, on any
-    architecture: the row contains exactly the tokens question k may attend to, in the same positions."""
+    architecture: the row contains exactly the tokens question k may attend to, in the same positions.
+
+    A question with `deps` composes its row from the branches of its whole dependency closure (topological order)
+    followed by its own branch, with positions running sequentially from len(state) through the row. A question
+    without deps produces exactly the packed slice, positions included."""
     seg = enc["seg"]; Ls = seg.count(0)
-    rows, start = [], Ls
-    for k, (d, oi) in enumerate(zip(enc["decide_idx"], enc["opt_idx"]), start=1):
+    spans, start = [], Ls
+    for k, d in enumerate(enc["decide_idx"], start=1):
         end = d + 1                                    # <decide> is the last token of its branch
         if seg[start] != k or seg[end - 1] != k: raise ValueError("branch layout mismatch")
-        rows.append({"ids": enc["ids"][start:end], "pos": enc["pos"][start:end], "decide": d - start, "opts": [o - start for o in oi]})
-        start = end
+        spans.append((start, end)); start = end
+    deps = enc.get("deps") or [()] * len(spans)
+    rows = []
+    for k, ((start, end), d, oi) in enumerate(zip(spans, enc["decide_idx"], enc["opt_idx"])):
+        closure = dependency_closure(deps, k)
+        if not closure:
+            rows.append({"ids": enc["ids"][start:end], "pos": enc["pos"][start:end], "decide": d - start, "opts": [o - start for o in oi]})
+            continue
+        prefix = [t for j in closure for t in enc["ids"][spans[j][0]:spans[j][1]]]
+        row = prefix + enc["ids"][start:end]
+        rows.append({"ids": row, "pos": list(range(Ls, Ls + len(row))), "decide": len(prefix) + d - start,
+                     "opts": [len(prefix) + o - start for o in oi]})
     return enc["ids"][:Ls], enc["pos"][:Ls], rows
 
 
 class PointerHead(nn.Module):
-    def __init__(self, d, dp=256):
-        """dp = pointer dimension (head capacity knob)."""
+    def __init__(self, d, dp=256, dustbin=False):
+        """dp = pointer dimension (head capacity knob).
+
+        dustbin=True appends one learned UNKNOWN key, so the readout is a distribution over K+1 outcomes: the K options
+        plus "none of these is supported by the evidence". `null_bias` is added after the 1/sqrt(dp) scale and starts
+        at -5, so the dustbin logit really is -5 at init (quiet next to a warm-started head's option logits)."""
         super().__init__()
         self.q, self.k = nn.Linear(d, dp), nn.Linear(d, dp)
         self.scale = 1 / math.sqrt(dp)
+        self.dustbin = dustbin
+        if dustbin:
+            self.null_key = nn.Parameter(torch.zeros(dp))
+            self.null_bias = nn.Parameter(torch.tensor(-5.0))
 
-    def forward(self, h_decide, h_opts):  # [d], [K,d] -> logits [K]
-        return (self.k(h_opts) @ self.q(h_decide)) * self.scale
+    def forward(self, h_decide, h_opts):  # [d], [K,d] -> logits [K] (or [K+1] with a dustbin)
+        q = self.q(h_decide)
+        z = (self.k(h_opts) @ q) * self.scale
+        if self.dustbin:
+            z = torch.cat([z, ((self.null_key @ q) * self.scale + self.null_bias).reshape(1)])
+        return z
 
 
 class DecisionModel(nn.Module):
-    def __init__(self, name, tok, device, lora=None, revision=None, attn=None, head_dim=256, option_isolation=False, special_embeddings=False, lora_targets="all", dtype=torch.float32):
+    def __init__(self, name, tok, device, lora=None, revision=None, attn=None, head_dim=256, option_isolation=False, special_embeddings=False, lora_targets="all", dtype=torch.float32,
+                 dustbin=False, evidence=False):
         super().__init__()
         # backbone only (no vocab head): we never generate text.
         # eager on MPS/CPU (known-good with our float 4D mask); SDPA on CUDA (accepts arbitrary additive masks).
@@ -156,13 +244,24 @@ class DecisionModel(nn.Module):
                 targets = targets + ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"]
             cfg = LoraConfig(task_type="FEATURE_EXTRACTION", r=lora, lora_alpha=2 * lora, lora_dropout=0.05, target_modules=targets, **extra)
             self.lm = get_peft_model(self.lm, cfg)
-        self.head = PointerHead(self.lm.config.hidden_size, dp=head_dim)
+        self.head = PointerHead(self.lm.config.hidden_size, dp=head_dim, dustbin=dustbin)
+        # second pointer: same <decide> query, keys are the state tokens that end each sentence (kev.model.encode)
+        self.evidence_head = PointerHead(self.lm.config.hidden_size, dp=head_dim) if evidence else None
         self.device = device
         self.to(device)
 
     def encode(self, tok, rec, **kw):
         """encode() with this model's option-isolation setting; use this from serving/eval code."""
         return encode(tok, rec, option_isolation=self.option_isolation, **kw)
+
+    def head_parameters(self):
+        """Every pointer-head parameter (answer head incl. dustbin, evidence head): what --head_lr governs."""
+        return list(self.head.parameters()) + (list(self.evidence_head.parameters()) if self.evidence_head is not None else [])
+
+    def needs_rows(self, encs):
+        """Recurrent backbones cannot honour the packed block-causal mask; neither can a question that must see another
+        question's branch. Both are served by the row form."""
+        return self.hybrid or any(any(d) for e in encs for d in (e.get("deps") or ()))
 
     def hidden(self, enc):
         return self.hidden_batch([enc])[0, : len(enc["ids"])]
@@ -189,7 +288,15 @@ class DecisionModel(nn.Module):
     def _readout(self, h, enc):
         return [self.head(h[d], h[torch.tensor(oi, device=self.device)]) for d, oi in zip(enc["decide_idx"], enc["opt_idx"])]
 
-    def forward_rows_batch(self, encs):
+    def _evidence_logits(self, h, decide_positions, enc):
+        """Pointer logits over this record's sentence keys, one list per position in `decide_positions`. `h` must hold
+        the state tokens at enc["sent_idx"] (the packed pass and every row both start with the state; the serving
+        prefix path passes the cached state hidden states instead). None when there is nothing to point at."""
+        if self.evidence_head is None or not enc.get("sent_idx"): return None
+        keys = h[torch.tensor(enc["sent_idx"], device=self.device)]
+        return [self.evidence_head(h[d], keys) for d in decide_positions]
+
+    def forward_rows_batch(self, encs, evidence=False):
         """Row form: every question of every record is one causal row = state tokens + its branch tokens, right-padded
         into a single batch. Returns the same nested logits as forward_batch. Exact isolation by construction (rows are
         independent); the state is recomputed per row (Q x state tokens), which training accepts; serving uses the
@@ -207,33 +314,44 @@ class DecisionModel(nn.Module):
         for i, (rid, rpos, _, _) in enumerate(rows):
             ids[i, : len(rid)] = torch.tensor(rid, device=self.device); pos[i, : len(rpos)] = torch.tensor(rpos, device=self.device); att[i, : len(rid)] = 1
         h = self.lm(input_ids=ids, position_ids=pos, attention_mask=att).last_hidden_state.float()
-        out = [[] for _ in encs]
+        out, ev = [[] for _ in encs], [[] for _ in encs]
         for i, (b, (_, _, d, oi)) in enumerate(zip(owners, rows)):
             out[b].append(self.head(h[i, d], h[i, torch.tensor(oi, device=self.device)]))
-        return out
+            if evidence:
+                pointed = self._evidence_logits(h[i], [d], encs[b])
+                ev[b].append(pointed[0] if pointed else None)
+        return (out, ev) if evidence else out
 
-    def forward(self, enc):
-        """Returns list of logits tensors, one per question."""
-        if self.hybrid: return self.forward_rows_batch([enc])[0]
-        return self._readout(self.hidden(enc), enc)
+    def forward(self, enc, evidence=False):
+        """Returns list of logits tensors, one per question (and, with evidence=True, the sentence-pointer logits)."""
+        if self.needs_rows([enc]):
+            out = self.forward_rows_batch([enc], evidence=evidence)
+            return (out[0][0], out[1][0]) if evidence else out[0]
+        h = self.hidden(enc)
+        z = self._readout(h, enc)
+        return (z, self._evidence_logits(h, enc["decide_idx"], enc)) if evidence else z
 
-    def forward_batch(self, encs):
+    def forward_batch(self, encs, evidence=False):
         """List (per record) of lists (per question) of logits, from one padded forward pass."""
-        if self.hybrid: return self.forward_rows_batch(encs)
+        if self.needs_rows(encs): return self.forward_rows_batch(encs, evidence=evidence)
         hs = self.hidden_batch(encs)
-        return [self._readout(hs[b], e) for b, e in enumerate(encs)]
+        out = [self._readout(hs[b], e) for b, e in enumerate(encs)]
+        return (out, [self._evidence_logits(hs[b], e["decide_idx"], e) for b, e in enumerate(encs)]) if evidence else out
 
     @torch.no_grad()
-    def probs(self, enc):
-        return [F.softmax(z, -1).cpu() for z in self.forward(enc)]
+    def probs(self, enc, evidence=False):
+        if not evidence: return [F.softmax(z, -1).cpu() for z in self.forward(enc)]
+        zs, ez = self.forward(enc, evidence=True)
+        return [F.softmax(z, -1).cpu() for z in zs], _softmax_or_none(ez)
 
     # --- state-prefix reuse (serving): the state is encoded once, question branches attend to its cached keys/values.
     # Exact by construction: branch tokens never attend to each other across questions (block-causal mask) and the state
     # never sees the branches (causal), so the state's hidden states and KV are identical with or without the branches.
 
-    def _branch_rows_from_prefix(self, enc, cache):
-        """Hybrid serving: replicate the cached state once per question and run the branches as causal rows (exactly the
-        forward_rows_batch layout, minus the recomputed state). The cache is consumed (replicated, then extended)."""
+    def _branch_rows_from_prefix(self, enc, cache, h_state=None, evidence=False):
+        """Row serving: replicate the cached state once per question and run the branches as causal rows (exactly the
+        forward_rows_batch layout, minus the recomputed state). The cache is consumed (replicated, then extended).
+        Used for hybrid backbones and for records whose questions carry dependencies."""
         S, Sp, rows = rows_of(enc); Q = len(rows)
         cache.reorder_cache(torch.zeros(Q, dtype=torch.long, device=self.device))
         W = max(len(r["ids"]) for r in rows)
@@ -243,7 +361,12 @@ class DecisionModel(nn.Module):
         for i, r in enumerate(rows):
             ids[i, : len(r["ids"])] = torch.tensor(r["ids"], device=self.device); pos[i, : len(r["pos"])] = torch.tensor(r["pos"], device=self.device); att[i, : len(S) + len(r["ids"])] = 1
         h = self.lm(input_ids=ids, position_ids=pos, attention_mask=att, past_key_values=cache, use_cache=True).last_hidden_state.float()
-        return [F.softmax(self.head(h[i, r["decide"]], h[i, torch.tensor(r["opts"], device=self.device)]), -1).cpu() for i, r in enumerate(rows)]
+        ps = [F.softmax(self.head(h[i, r["decide"]], h[i, torch.tensor(r["opts"], device=self.device)]), -1).cpu() for i, r in enumerate(rows)]
+        if not evidence: return ps
+        # the state is not recomputed here, so the sentence keys come from the cached state hidden states
+        ez = None if self.evidence_head is None or not enc.get("sent_idx") else \
+            [self.evidence_head(h[i, r["decide"]], h_state[torch.tensor(enc["sent_idx"], device=self.device)]) for i, r in enumerate(rows)]
+        return ps, _softmax_or_none(ez)
 
     @torch.no_grad()
     def prefix(self, enc):
@@ -256,34 +379,36 @@ class DecisionModel(nn.Module):
         return Ls, out.past_key_values, out.last_hidden_state[0].float()
 
     @torch.no_grad()
-    def probs_and_prefix(self, enc):
+    def probs_and_prefix(self, enc, evidence=False):
         """One full pass that also returns the state prefix (KV cropped to the state, state hidden states): a cache miss
         costs a single forward pass, not two."""
         from transformers import DynamicCache
         Ls = enc["seg"].count(0)
-        if self.hybrid:
+        if self.needs_rows([enc]):
             # recurrent layers cannot be cropped back to the state, so a hybrid miss is state pass + branch rows (the
             # state pass is kept as the reusable prefix by running it twice? no: copy the cache before consuming it)
             Ls, cache, h_state = self.prefix(enc)
             import copy
-            return self._branch_rows_from_prefix(enc, copy.deepcopy(cache)), (Ls, cache, h_state)
+            return self._branch_rows_from_prefix(enc, copy.deepcopy(cache), h_state, evidence), (Ls, cache, h_state)
         ids = torch.tensor([enc["ids"]], device=self.device); pos = torch.tensor([enc["pos"]], device=self.device)
         dt = next(self.lm.parameters()).dtype
         mask = branch_mask_batch([enc["seg"]], self.device, dtype=dt, opts=[enc["opt"]] if enc.get("option_isolation") else None)
         out = self.lm(input_ids=ids, position_ids=pos, attention_mask=mask, past_key_values=DynamicCache(config=self.lm.config), use_cache=True)
         h = out.last_hidden_state[0].float()
         out.past_key_values.crop(-(len(enc["ids"]) - Ls))     # keep the state only (negative = drop that many trailing tokens; positive form deprecated in transformers 5)
-        return [F.softmax(z, -1).cpu() for z in self._readout(h, enc)], (Ls, out.past_key_values, h[:Ls].clone())
+        ps = [F.softmax(z, -1).cpu() for z in self._readout(h, enc)]
+        result = (ps, _softmax_or_none(self._evidence_logits(h, enc["decide_idx"], enc))) if evidence else ps
+        return result, (Ls, out.past_key_values, h[:Ls].clone())
 
     @torch.no_grad()
-    def probs_with_prefix(self, enc, prefix):
+    def probs_with_prefix(self, enc, prefix, evidence=False):
         """probs() for a record whose state tokens equal the cached prefix's; only the branches run. The cache is cropped
         back to the state afterwards so it can be reused."""
         Ls, cache, h_state = prefix
         if enc["seg"].count(0) != Ls: raise ValueError("prefix does not match this record's state")
-        if self.hybrid:
+        if self.needs_rows([enc]):
             import copy
-            return self._branch_rows_from_prefix(enc, copy.deepcopy(cache))   # the stored prefix stays pristine
+            return self._branch_rows_from_prefix(enc, copy.deepcopy(cache), h_state, evidence)   # the stored prefix stays pristine
         ids = torch.tensor([enc["ids"][Ls:]], device=self.device); pos = torch.tensor([enc["pos"][Ls:]], device=self.device)
         dt = next(self.lm.parameters()).dtype
         mask = branch_mask_batch([enc["seg"]], self.device, dtype=dt, opts=[enc["opt"]] if enc.get("option_isolation") else None)[:, :, Ls:, :]
@@ -292,7 +417,8 @@ class DecisionModel(nn.Module):
             h = torch.cat([h_state, out.last_hidden_state[0].float()], 0)
         finally:
             cache.crop(-(len(enc["ids"]) - Ls))
-        return [F.softmax(z, -1).cpu() for z in self._readout(h, enc)]
+        ps = [F.softmax(z, -1).cpu() for z in self._readout(h, enc)]
+        return (ps, _softmax_or_none(self._evidence_logits(h, enc["decide_idx"], enc))) if evidence else ps
 
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
