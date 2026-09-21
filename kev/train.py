@@ -306,7 +306,8 @@ def main():
                 if dev == "mps": torch.mps.empty_cache()
                 if step % 10 == 0:
                     print(f"ep{ep} step {step}/{steps} loss {run['ce']/run['n']:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} "
-                          f"evidence {run['ev']/max(run['ev_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
+                          f"evidence {run['ev']/max(run['ev_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec"
+                          + (f" peak {torch.cuda.max_memory_allocated() / 2**30:.1f}G" if dev == "cuda" else ""), flush=True)
                     run = Counter()
     os.makedirs(a.out, exist_ok=True)
     model.lm.save_pretrained(a.out)

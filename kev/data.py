@@ -314,7 +314,7 @@ def augment(req, rng, p_none=0.1, p_none_distract=0.12, p_distract=0.15):
     answer (true option removed) or as a wrong alternative (true option kept); sometimes add an irrelevant distractor."""
     if min(p_none, p_none_distract, p_distract) < 0 or p_none + p_none_distract + p_distract > 1:
         raise ValueError("augmentation probabilities must be nonnegative and sum to at most one")
-    out = {"state": req["state"], "questions": {}}
+    out = {"state": req["state"], "questions": {}, **({"_meta": req["_meta"]} if "_meta" in req else {})}   # _meta.sentences feed the evidence pointer (materialize)
     for qid, q in req["questions"].items():
         if q["type"] != "choice":
             out["questions"][qid] = q; continue
@@ -345,9 +345,10 @@ def none_pair(req, rng):
     qid, q = rng.choice(eligible)
     nk, nd = rng.choice([o for o in NONE_OPTIONS if o[0] not in q["criteria"]] or [("none_of_these", None)])
     keys = list(q["criteria"]) + [nk]; rng.shuffle(keys)
-    present = {**q, "criteria": {k: (nd if k == nk else q["criteria"][k]) for k in keys}}
+    present = {**{k: v for k, v in q.items() if k != "deps"}, "criteria": {k: (nd if k == nk else q["criteria"][k]) for k in keys}}   # a one-question record has nothing to depend on
     absent = {**present, "criteria": {k: v for k, v in present["criteria"].items() if k != q["label"]}, "label": nk}
-    return [{"state": req["state"], "questions": {qid: present}}, {"state": req["state"], "questions": {qid: absent}}]
+    meta = {"_meta": req["_meta"]} if "_meta" in req else {}
+    return [{"state": req["state"], "questions": {qid: present}, **meta}, {"state": req["state"], "questions": {qid: absent}, **meta}]
 
 
 def load_records(path, source="custom"):

@@ -214,3 +214,21 @@ def test_stack_plans_are_accepted_by_the_trial_allowlist():
     assert all(t["replay"] == 2000 and t["init_from"] == "jaredpalmer/kev-4b" and t["lr"] == 2e-5 for t in trials)
     with pytest.raises(ValueError, match="invalid dustbin"):
         validated_trial({**plan[0], "dustbin": 2}, manifest)
+
+
+def test_training_augmentation_keeps_evidence_and_deps_consistent(tok):
+    """The trainer materializes augment()'s output, so the sentences must survive it (or the evidence loss silently never
+    fires), and a none_pair record, being one question on its own, must not keep dependencies it cannot resolve."""
+    import random
+    from kev.data import augment, none_pair
+    record = expand(certificate_record())
+    record["questions"]["decision"]["criteria"]["escalate"] = "Send the case to a reviewer"   # 3 options: none_pair-eligible
+    for seed in range(5):
+        variant = augment(record, random.Random(seed), p_none=0.3, p_none_distract=0.3, p_distract=0.3)
+        enc = encode(tok, materialize(variant), strict=True)
+        assert len(enc["sent_idx"]) == len(record["_meta"]["sentences"])
+        assert all(gold for gold in enc["evidence"]), "every expanded question has gold sentences"
+        assert any(enc["deps"]), "dependencies survive augmentation"
+        for single in none_pair(record, random.Random(seed)):
+            enc1 = encode(tok, materialize(single), strict=True)
+            assert enc1["deps"] == [()] and enc1["evidence"][0] and len(enc1["sent_idx"]) == len(record["_meta"]["sentences"])
