@@ -1,0 +1,109 @@
+{
+  "seed": "stack-20260921",
+  "suite": "evals/v7/decision-v7",
+  "tokenizer": {
+    "name": "Qwen/Qwen3.5-0.8B-Base",
+    "revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"
+  },
+  "legacy_pairs_per_family": 30,
+  "legacy_families": [
+    "return_window",
+    "spend_threshold",
+    "age_eligibility",
+    "quantity_limit",
+    "warranty_claim",
+    "sla_response",
+    "late_fee",
+    "volume_discount",
+    "shipping_delay"
+  ],
+  "excluded_evaluation_states": 4147,
+  "files": {
+    "dag.jsonl": {
+      "records": 1680,
+      "sha256": "54b22e48d09505118eb7336f6733146a9de68a634b8ccb9846eac7063d095e48",
+      "sources": [
+        "stack_dag"
+      ],
+      "questions": 10836
+    },
+    "dag_nodeps.jsonl": {
+      "records": 1680,
+      "sha256": "e44394ff221ab6a976d6666b11c6ae9f9e1ed4efb683e5f6e88e59df8e8463e1",
+      "sources": [
+        "stack_dag"
+      ],
+      "questions": 10836
+    },
+    "unknown_dustbin.jsonl": {
+      "records": 4960,
+      "sha256": "2b68c6bee492c959e60d7fb70131bfbd8ad0541ff9bb18a6389178cd0ed18120",
+      "sources": [
+        "stack_legacy",
+        "stack_unknown",
+        "stack_unknown_control"
+      ],
+      "questions": 23272
+    },
+    "stack_dustbin.jsonl": {
+      "records": 6640,
+      "sha256": "113c6f5ad106545283de9cd5817223bb02986f03bb3cc77a69be7bb3d775fdc1",
+      "sources": [
+        "stack_dag",
+        "stack_legacy",
+        "stack_unknown",
+        "stack_unknown_control"
+      ],
+      "questions": 34108,
+      "concat_of": [
+        "dag.jsonl",
+        "unknown_dustbin.jsonl"
+      ]
+    },
+    "unknown_uniform.jsonl": {
+      "records": 4960,
+      "sha256": "73ef8bc3c73604faac4aed9cc2b2b79b36f94938e25f2fea50de6bd74ad852fc",
+      "sources": [
+        "stack_legacy",
+        "stack_unknown",
+        "stack_unknown_control"
+      ],
+      "questions": 23272
+    },
+    "stack_uniform.jsonl": {
+      "records": 6640,
+      "sha256": "f84cef1e85a699fddb8f39a84269f0cb16275d34d1d2f2e866db21ed513284e2",
+      "sources": [
+        "stack_dag",
+        "stack_legacy",
+        "stack_unknown",
+        "stack_unknown_control"
+      ],
+      "questions": 34108,
+      "concat_of": [
+        "dag.jsonl",
+        "unknown_uniform.jsonl"
+      ]
+    }
+  },
+  "admission": {
+    "dag.jsonl": {
+      "considered": 1680,
+      "accepted": 1680
+    },
+    "unknown_dustbin.jsonl": {
+      "v9_unknowable_collisions": 7,
+      "considered": 4980,
+      "accepted": 4960,
+      "evaluation_overlap": 20,
+      "deciding_fact_decided_nothing": 0
+    },
+    "unknown_uniform.jsonl": {
+      "v9_unknowable_collisions": 7,
+      "considered": 4980,
+      "accepted": 4960,
+      "evaluation_overlap": 20,
+      "deciding_fact_decided_nothing": 0
+    }
+  }
+}

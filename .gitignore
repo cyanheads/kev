@@ -98,3 +98,7 @@ evals/public-pool-v6/train.jsonl
 evals/public-pool-v4/train.jsonl
 evals/v7/decision-v7/train.jsonl
 evals/v8/decision-v8/train.jsonl
+
+# stack training records over ~10 MB: rebuilt byte-for-byte by scripts/build_stack_data.py (hashes in evals/stack/manifest.json)
+evals/stack/unknown_*.jsonl
+evals/stack/stack_*.jsonl
